@@ -79,15 +79,18 @@ class MTGRBeautyDataset(Dataset):
         with open(datamaps_file, 'rb') as f:
             datamaps = pickle.load(f)
             self.user2id = datamaps['user2id']
-            self.item2id = datamaps['item2id']
-            self.id2item = datamaps['id2item']
 
         logger.info(f"Loading item features from {item_features_file}")
         with open(item_features_file, 'rb') as f:
             self.item_features = pickle.load(f)
 
-        # Create list of all item IDs for negative sampling
-        self.all_item_ids = list(self.item_features.keys())
+        # IMPORTANT: Training data already uses integer IDs (as strings)
+        # item_features keys ARE the integer IDs, not the ASIN strings
+        # So we create a simple identity mapping: item_id_str -> int(item_id_str)
+        self.item2id = {item_id_str: int(item_id_str) for item_id_str in self.item_features.keys()}
+
+        # Create list of all item IDs for negative sampling (as integers)
+        self.all_item_ids = list(self.item2id.values())
 
         # Define feature keys for KJTs
         # UIH keys: user features + sequence features
@@ -129,12 +132,34 @@ class MTGRBeautyDataset(Dataset):
         seq_len = len(user_seq['full_item_ids'])
 
         # Dynamic slicing: choose random slice point t
-        if self.is_inference:
-            # For inference, use the last item as target
-            t = seq_len - 1
+        # Try to find a valid position where the target item exists in item2id
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            if self.is_inference:
+                # For inference, use the last item as target
+                t = seq_len - 1
+            else:
+                # For training, random slice (ensure at least 1 history item)
+                t = random.randint(1, seq_len - 1)
+
+            # Check if target item exists in item2id
+            target_item_str = user_seq['full_item_ids'][t]
+            if target_item_str in self.item2id:
+                break
+
+            # If inference mode and item not found, try previous items
+            if self.is_inference and t > 1:
+                continue
         else:
-            # For training, random slice (ensure at least 1 history item)
-            t = random.randint(1, seq_len - 1)
+            # If no valid item found after max_attempts, use a default fallback
+            # Find first valid item in the sequence
+            for i in range(1, seq_len):
+                if user_seq['full_item_ids'][i] in self.item2id:
+                    t = i
+                    break
+            else:
+                # If still no valid item, skip this sample by using item 0 (should exist)
+                raise ValueError(f"User {idx} has no valid items in item2id mapping")
 
         # Extract history [0:t]
         history = {
@@ -187,12 +212,21 @@ class MTGRBeautyDataset(Dataset):
         seq_brands = history['brands'][-actual_seq_len:] if actual_seq_len < len(history['brands']) else history['brands']
         seq_prices = history['prices'][-actual_seq_len:] if actual_seq_len < len(history['prices']) else history['prices']
 
-        # Convert to integer IDs and add to KJT
-        seq_item_ids_int = [self.item2id[item_id] for item_id in seq_item_ids]
-        # For simplicity, hash categories and brands to integers
-        seq_category_ids = [hash(cat) % 10000 for cat in seq_categories]
-        seq_brand_ids = [hash(brand) % 10000 for brand in seq_brands]
-        seq_price_ids = [int(price * 100) for price in seq_prices]  # Convert to cents
+        # Filter out items that don't exist in item2id and convert to integer IDs
+        seq_item_ids_int = []
+        seq_category_ids = []
+        seq_brand_ids = []
+        seq_price_ids = []
+
+        for i, item_id in enumerate(seq_item_ids):
+            if item_id in self.item2id:
+                seq_item_ids_int.append(self.item2id[item_id])
+                seq_category_ids.append(hash(seq_categories[i]) % 10000)
+                seq_brand_ids.append(hash(seq_brands[i]) % 10000)
+                seq_price_ids.append(int(seq_prices[i] * 100))  # Convert to cents
+
+        # Update actual sequence length after filtering
+        actual_seq_len = len(seq_item_ids_int)
 
         uih_values.extend(seq_item_ids_int)
         uih_lengths.append(actual_seq_len)
@@ -224,8 +258,8 @@ class MTGRBeautyDataset(Dataset):
             cross_features = self.compute_cross_features(history, cand_id)
             cand_values.append(cross_features['brand_count'])
 
-            # Item features
-            item_feats = self.item_features[cand_id]
+            # Item features (convert int ID to string for lookup)
+            item_feats = self.item_features[str(cand_id)]
             cand_values.append(cand_id)  # Item ID
             cand_values.append(hash(item_feats['category']) % 10000)  # Category
             cand_values.append(hash(item_feats['brand']) % 10000)  # Brand
@@ -260,7 +294,8 @@ class MTGRBeautyDataset(Dataset):
             List of negative item IDs (as integers)
         """
         # Convert user history to set of integer IDs for fast lookup
-        user_history_ids = {self.item2id[item_id] for item_id in user_history}
+        # Filter out items that don't exist in item2id
+        user_history_ids = {self.item2id[item_id] for item_id in user_history if item_id in self.item2id}
 
         negatives = []
         max_attempts = num_samples * 10  # Prevent infinite loop
@@ -319,8 +354,8 @@ class MTGRBeautyDataset(Dataset):
         Returns:
             Dictionary with computed cross features
         """
-        # Get candidate's brand
-        candidate_brand = self.item_features[candidate_item_id]['brand']
+        # Get candidate's brand (convert int ID to string for lookup)
+        candidate_brand = self.item_features[str(candidate_item_id)]['brand']
 
         # Count occurrences of candidate's brand in user history
         brand_count = sum(1 for brand in history['brands'] if brand == candidate_brand)
