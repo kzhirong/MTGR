@@ -46,46 +46,84 @@ def create_mtgr_config(dataset):
     return config
 
 
-def create_embedding_tables(config):
-    """Create embedding tables for all MTGR features."""
+def create_embedding_tables(config, dataset):
+    """Create embedding tables for all MTGR features with proper sizes."""
     tables = {}
+
+    # Determine vocabulary sizes from dataset
+    max_user_id = max(dataset.user2id.values())
+    max_item_id = max(dataset.item2id.values())
+
+    logger.info(f"Embedding vocab sizes: user_id={max_user_id + 1}, item_id={max_item_id + 1}")
 
     # User features
     for feature_name in config.mtgr_user_feature_names:
+        if feature_name == 'user_id':
+            num_emb = max_user_id + 1  # User ID vocabulary
+        elif 'rating' in feature_name:
+            num_emb = 51  # Rating * 10: 0-50 (for 0.0-5.0 ratings)
+        elif 'review' in feature_name:
+            num_emb = 5000  # Review length vocabulary
+        else:
+            num_emb = 1000  # Default
+
         tables[feature_name] = EmbeddingConfig(
             name=feature_name,
             embedding_dim=config.hstu_embedding_table_dim,
-            num_embeddings=10000 if 'id' in feature_name else 1000,
+            num_embeddings=num_emb,
             data_type=DataType.FP32,
             pooling=PoolingType.NONE,
         )
 
     # Sequence features
     for feature_name in config.mtgr_seq_feature_names:
+        if 'item_id' in feature_name or 'item' in feature_name:
+            num_emb = max_item_id + 1  # Item ID vocabulary
+        elif 'category' in feature_name or 'brand' in feature_name:
+            num_emb = 10000  # Hashed category/brand features
+        elif 'price' in feature_name:
+            num_emb = 100000  # Price in cents (up to $1000)
+        else:
+            num_emb = 10000  # Default
+
         tables[feature_name] = EmbeddingConfig(
             name=feature_name,
             embedding_dim=config.hstu_embedding_table_dim,
-            num_embeddings=10000 if 'id' in feature_name else 1000,
+            num_embeddings=num_emb,
             data_type=DataType.FP32,
             pooling=PoolingType.NONE,
         )
 
     # Cross features
     for feature_name in config.mtgr_cross_feature_names:
+        if 'count' in feature_name:
+            num_emb = 200  # Brand count features (0-200)
+        else:
+            num_emb = 1000  # Default
+
         tables[feature_name] = EmbeddingConfig(
             name=feature_name,
             embedding_dim=config.hstu_embedding_table_dim,
-            num_embeddings=100,  # Count features have small range
+            num_embeddings=num_emb,
             data_type=DataType.FP32,
             pooling=PoolingType.NONE,
         )
 
     # Candidate features
     for feature_name in config.mtgr_candidate_feature_names:
+        if 'item_id' in feature_name or 'item' in feature_name:
+            num_emb = max_item_id + 1  # Item ID vocabulary
+        elif 'category' in feature_name or 'brand' in feature_name:
+            num_emb = 10000  # Hashed category/brand features
+        elif 'price' in feature_name:
+            num_emb = 100000  # Price in cents
+        else:
+            num_emb = 10000  # Default
+
         tables[feature_name] = EmbeddingConfig(
             name=feature_name,
             embedding_dim=config.hstu_embedding_table_dim,
-            num_embeddings=10000 if 'id' in feature_name else 1000,
+            num_embeddings=num_emb,
             data_type=DataType.FP32,
             pooling=PoolingType.NONE,
         )
@@ -103,10 +141,10 @@ def test_end_to_end():
     logger.info("\n1. Loading MTGRBeautyDataset...")
     try:
         dataset = MTGRBeautyDataset(
-            data_file="/Users/zhirong/GitHub/generative-recommenders/data/Beauty_train.pkl",
-            datamaps_file="/Users/zhirong/GitHub/generative-recommenders/data/Beauty_datamaps.pkl",
-            item_features_file="/Users/zhirong/GitHub/generative-recommenders/data/Beauty_item_feature_map.pkl",
-            num_negatives=4,  # K-1 negatives (total K=5 candidates)
+            data_file="data/Beauty_train.pkl",
+            datamaps_file="data/Beauty_datamaps.pkl",
+            item_features_file="data/Beauty_item_feature_map.pkl",
+            num_negatives=4,
             max_seq_len=100,
         )
         logger.info(f"   ✓ Dataset loaded successfully")
@@ -168,7 +206,7 @@ def test_end_to_end():
     logger.info("\n5. Creating MTGR model...")
     try:
         config = create_mtgr_config(dataset)
-        embedding_tables = create_embedding_tables(config)
+        embedding_tables = create_embedding_tables(config, dataset)
 
         logger.info(f"   ✓ Config created")
         logger.info(f"   ✓ User features: {config.mtgr_user_feature_names}")

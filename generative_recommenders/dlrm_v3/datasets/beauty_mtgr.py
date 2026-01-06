@@ -79,18 +79,19 @@ class MTGRBeautyDataset(Dataset):
         with open(datamaps_file, 'rb') as f:
             datamaps = pickle.load(f)
             self.user2id = datamaps['user2id']
+            self.item2id = datamaps['item2id']
+            # id2item available if needed: datamaps['id2item']
 
         logger.info(f"Loading item features from {item_features_file}")
         with open(item_features_file, 'rb') as f:
             self.item_features = pickle.load(f)
 
-        # IMPORTANT: Training data already uses integer IDs (as strings)
-        # item_features keys ARE the integer IDs, not the ASIN strings
-        # So we create a simple identity mapping: item_id_str -> int(item_id_str)
-        self.item2id = {item_id_str: int(item_id_str) for item_id_str in self.item_features.keys()}
-
-        # Create list of all item IDs for negative sampling (as integers)
+        # For negative sampling, use only items with features
         self.all_item_ids = list(self.item2id.values())
+
+        logger.info(f"Loaded user2id mapping with {len(self.user2id)} users")
+        logger.info(f"Loaded item2id mapping with {len(self.item2id)} items")
+        logger.info(f"Negative sampling pool: {len(self.all_item_ids)} items")
 
         # Define feature keys for KJTs
         # UIH keys: user features + sequence features
