@@ -278,11 +278,11 @@ class DlrmHSTU(HammerModule):
             logger.info("Initializing MTGR tokenization MLPs")
 
             # User MLP: converts user features to tokens
+            # Paper: Each user feature becomes a separate token
             if len(hstu_configs.mtgr_user_feature_names) > 0:
                 self._mtgr_user_mlp: torch.nn.Module = torch.nn.Sequential(
                     torch.nn.Linear(
-                        in_features=hstu_configs.hstu_embedding_table_dim
-                        * len(hstu_configs.mtgr_user_feature_names),
+                        in_features=hstu_configs.hstu_embedding_table_dim,
                         out_features=512,
                     ),
                     SwishLayerNorm(512),
@@ -504,6 +504,7 @@ class DlrmHSTU(HammerModule):
         num_cand_tokens = 0
 
         # 1. User tokens (scalar features)
+        # Paper: Each user feature becomes a separate token (not concatenated)
         if len(self._hstu_configs.mtgr_user_feature_names) > 0:
             user_embeddings_list = [
                 user_embeddings[name].embedding
@@ -511,8 +512,13 @@ class DlrmHSTU(HammerModule):
                 if name in user_embeddings
             ]
             if user_embeddings_list:
-                user_concat = torch.cat(user_embeddings_list, dim=-1)
-                user_tokens = self._mtgr_user_mlp(user_concat)  # [B * num_user_features, d_model]
+                # Process each user feature separately to create one token per feature
+                user_token_list = []
+                for user_emb in user_embeddings_list:
+                    user_token = self._mtgr_user_mlp(user_emb)  # [B, d_model]
+                    user_token_list.append(user_token)
+                # Concatenate along dim=0: [B*num_features, d_model]
+                user_tokens = torch.cat(user_token_list, dim=0)
                 tokens_list.append(user_tokens)
                 num_user_tokens = len(self._hstu_configs.mtgr_user_feature_names)
 

@@ -229,8 +229,11 @@ def test_end_to_end():
         )
         logger.info(f"   ✓ Model initialized successfully")
 
-        # Move model to CPU (TorchRec initializes on meta device)
-        device = torch.device("cpu")
+        # Move model to GPU (SwishLayerNorm requires CUDA)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cpu":
+            logger.warning("   ⚠️  CUDA not available! SwishLayerNorm requires GPU, test may fail.")
+
         model = model.to_empty(device=device)
         # Reset parameters after moving from meta device
         model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
@@ -251,6 +254,10 @@ def test_end_to_end():
     # Step 6: Forward pass
     logger.info("\n6. Running forward pass (tokenization)...")
     try:
+        # Move batch to same device as model
+        batch.to(device)
+        logger.info(f"   ✓ Batch moved to {device}")
+
         with torch.no_grad():
             outputs = model(batch.uih_features_kjt, batch.candidates_features_kjt)
 
@@ -262,6 +269,7 @@ def test_end_to_end():
         logger.info(f"   ✓ Aux losses keys: {list(aux_losses.keys())}")
 
         # Calculate expected token counts
+        # Per MTGR paper: Each user feature becomes a separate token (not combined)
         batch_size = batch.uih_features_kjt.stride()
         num_user_features = len(config.mtgr_user_feature_names)
         num_candidates = 5  # 1 positive + 4 negatives
@@ -270,13 +278,17 @@ def test_end_to_end():
         total_seq_items = batch.uih_features_kjt.lengths()[3:7].sum().item()  # seq features
         avg_seq_len = total_seq_items // batch_size // 4  # 4 seq features
 
+        # Total tokens = (User tokens) + (Seq tokens) + (Candidate tokens)
+        # User: batch_size * num_user_features (each feature = 1 token per sample)
+        # Seq: total sequence items across batch
+        # Cand: batch_size * num_candidates
         expected_tokens = batch_size * (num_user_features + avg_seq_len + num_candidates)
 
         logger.info(f"\n   Token count analysis:")
         logger.info(f"   - Batch size: {batch_size}")
-        logger.info(f"   - User tokens per sample: {num_user_features}")
-        logger.info(f"   - Avg seq tokens per sample: ~{avg_seq_len}")
-        logger.info(f"   - Candidate tokens per sample: {num_candidates}")
+        logger.info(f"   - User features: {num_user_features} → User tokens: {batch_size * num_user_features}")
+        logger.info(f"   - Avg seq tokens per sample: ~{avg_seq_len} → Total seq tokens: ~{batch_size * avg_seq_len}")
+        logger.info(f"   - Candidate tokens per sample: {num_candidates} → Total cand tokens: {batch_size * num_candidates}")
         logger.info(f"   - Expected total tokens: ~{expected_tokens}")
         logger.info(f"   - Actual tokens: {user_emb.shape[0]}")
 
@@ -291,22 +303,33 @@ def test_end_to_end():
         traceback.print_exc()
         raise
 
-    # Summary
-    logger.info("\n" + "=" * 80)
-    logger.info("TEST SUMMARY")
-    logger.info("=" * 80)
-    logger.info("✓ Dataset loading: PASS")
-    logger.info("✓ Sample retrieval: PASS")
-    logger.info("✓ DataLoader batching: PASS")
-    logger.info("✓ Model initialization: PASS")
-    logger.info("✓ Forward pass (tokenization): PASS")
-    logger.info("\n✅ END-TO-END TEST PASSED!")
-    logger.info("=" * 80)
-    logger.info("\nPipeline verified:")
-    logger.info("  Beauty_train.pkl → MTGRBeautyDataset → DataLoader → DlrmHSTU → Tokens")
-    logger.info("\nPhase 1 Complete: MTGR tokenization is working!")
-    logger.info("=" * 80)
+    # Summary - Use print() instead of logger to ensure output in Colab
+    import sys
+    print("\n" + "=" * 80, flush=True)
+    print("TEST SUMMARY", flush=True)
+    print("=" * 80, flush=True)
+    print("✓ Dataset loading: PASS", flush=True)
+    print("✓ Sample retrieval: PASS", flush=True)
+    print("✓ DataLoader batching: PASS", flush=True)
+    print("✓ Model initialization: PASS", flush=True)
+    print("✓ Forward pass (tokenization): PASS", flush=True)
+    print("\n✅ END-TO-END TEST PASSED!", flush=True)
+    print("=" * 80, flush=True)
+    print("\nPipeline verified:", flush=True)
+    print("  Beauty_train.pkl → MTGRBeautyDataset → DataLoader → DlrmHSTU → Tokens", flush=True)
+    print("\nPhase 1 Complete: MTGR tokenization is working!", flush=True)
+    print("=" * 80, flush=True)
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    test_end_to_end()
+    try:
+        test_end_to_end()
+        print("\n" + "="*80)
+        print("🎉 TEST SCRIPT COMPLETED SUCCESSFULLY!")
+        print("="*80)
+    except Exception as e:
+        print("\n" + "="*80)
+        print(f"❌ TEST SCRIPT FAILED: {e}")
+        print("="*80)
+        raise
