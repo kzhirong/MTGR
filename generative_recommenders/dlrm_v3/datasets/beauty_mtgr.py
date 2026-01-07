@@ -45,18 +45,20 @@ class MTGRBeautyDataset(Dataset):
 
     Args:
         data_file: Path to the Beauty dataset pickle file (e.g., Beauty_train.pkl)
-        datamaps_file: Path to the ID mappings (Beauty_datamaps.pkl)
         item_features_file: Path to item metadata (Beauty_item_feature_map.pkl)
         num_negatives: Number of negative samples per positive sample (K-1)
         max_seq_len: Maximum sequence length for UIH
         is_inference: Whether this is for inference (no random slicing/negatives)
         hstu_config: Optional HSTU model configuration (for compatibility)
+
+    Note:
+        Beauty dataset already uses integer IDs (as strings) in the training data.
+        No datamaps needed - we convert directly with int(id_string).
     """
 
     def __init__(
         self,
         data_file: str,
-        datamaps_file: str,
         item_features_file: str,
         num_negatives: int = 4,
         max_seq_len: int = 100,
@@ -75,23 +77,17 @@ class MTGRBeautyDataset(Dataset):
         with open(data_file, 'rb') as f:
             self.users = pickle.load(f)
 
-        logger.info(f"Loading datamaps from {datamaps_file}")
-        with open(datamaps_file, 'rb') as f:
-            datamaps = pickle.load(f)
-            self.user2id = datamaps['user2id']
-            self.item2id = datamaps['item2id']
-            # id2item available if needed: datamaps['id2item']
-
         logger.info(f"Loading item features from {item_features_file}")
         with open(item_features_file, 'rb') as f:
             self.item_features = pickle.load(f)
 
-        # For negative sampling, use only items with features
-        self.all_item_ids = list(self.item2id.values())
+        # For negative sampling, use all items that have features
+        # Item features keys are already integer IDs (as strings)
+        self.all_item_ids = [int(item_id_str) for item_id_str in self.item_features.keys()]
 
-        logger.info(f"Loaded user2id mapping with {len(self.user2id)} users")
-        logger.info(f"Loaded item2id mapping with {len(self.item2id)} items")
-        logger.info(f"Negative sampling pool: {len(self.all_item_ids)} items")
+        logger.info(f"Dataset initialized with {len(self.users)} users")
+        logger.info(f"Total items with features: {len(self.all_item_ids)}")
+        logger.info(f"Num negatives per positive: {self.num_negatives}")
 
         # Define feature keys for KJTs
         # UIH keys: user features + sequence features
@@ -143,9 +139,9 @@ class MTGRBeautyDataset(Dataset):
                 # For training, random slice (ensure at least 1 history item)
                 t = random.randint(1, seq_len - 1)
 
-            # Check if target item exists in item2id
+            # Check if target item has features
             target_item_str = user_seq['full_item_ids'][t]
-            if target_item_str in self.item2id:
+            if target_item_str in self.item_features:
                 break
 
             # If inference mode and item not found, try previous items
@@ -155,12 +151,12 @@ class MTGRBeautyDataset(Dataset):
             # If no valid item found after max_attempts, use a default fallback
             # Find first valid item in the sequence
             for i in range(1, seq_len):
-                if user_seq['full_item_ids'][i] in self.item2id:
+                if user_seq['full_item_ids'][i] in self.item_features:
                     t = i
                     break
             else:
-                # If still no valid item, skip this sample by using item 0 (should exist)
-                raise ValueError(f"User {idx} has no valid items in item2id mapping")
+                # If still no valid item, skip this sample
+                raise ValueError(f"User {idx} has no valid items in item_features")
 
         # Extract history [0:t]
         history = {
@@ -172,8 +168,8 @@ class MTGRBeautyDataset(Dataset):
             'review_lens': user_seq['full_review_lens'][:t],
         }
 
-        # Positive candidate (target at position t)
-        pos_item_id = self.item2id[user_seq['full_item_ids'][t]]
+        # Positive candidate (target at position t) - convert string to int
+        pos_item_id = int(user_seq['full_item_ids'][t])
 
         # Sample negative candidates
         if not self.is_inference:
@@ -194,8 +190,8 @@ class MTGRBeautyDataset(Dataset):
         uih_values = []
         uih_lengths = []
 
-        # User ID (scalar)
-        uih_values.append(self.user2id[user['user_id']])
+        # User ID (scalar) - convert string to int
+        uih_values.append(int(user['user_id']))
         uih_lengths.append(1)
 
         # Avg rating (scalar, quantized to int)
@@ -213,15 +209,15 @@ class MTGRBeautyDataset(Dataset):
         seq_brands = history['brands'][-actual_seq_len:] if actual_seq_len < len(history['brands']) else history['brands']
         seq_prices = history['prices'][-actual_seq_len:] if actual_seq_len < len(history['prices']) else history['prices']
 
-        # Filter out items that don't exist in item2id and convert to integer IDs
+        # Filter out items that don't have features and convert to integer IDs
         seq_item_ids_int = []
         seq_category_ids = []
         seq_brand_ids = []
         seq_price_ids = []
 
         for i, item_id in enumerate(seq_item_ids):
-            if item_id in self.item2id:
-                seq_item_ids_int.append(self.item2id[item_id])
+            if item_id in self.item_features:
+                seq_item_ids_int.append(int(item_id))  # Convert string to int
                 seq_category_ids.append(hash(seq_categories[i]) % 10000)
                 seq_brand_ids.append(hash(seq_brands[i]) % 10000)
                 seq_price_ids.append(int(seq_prices[i] * 100))  # Convert to cents
@@ -250,21 +246,29 @@ class MTGRBeautyDataset(Dataset):
 
         # === Build Candidates KJT (Cross + Item features) ===
         num_candidates = len(candidate_ids)
-        cand_values = []
         cand_lengths = []
 
-        # For each candidate, compute features
+        # Collect features for all candidates (grouped by feature type)
+        brand_counts = []
+        item_ids = []
+        categories = []
+        brands = []
+        prices = []
+
         for cand_id in candidate_ids:
             # Cross features
             cross_features = self.compute_cross_features(history, cand_id)
-            cand_values.append(cross_features['brand_count'])
+            brand_counts.append(cross_features['brand_count'])
 
             # Item features (convert int ID to string for lookup)
             item_feats = self.item_features[str(cand_id)]
-            cand_values.append(cand_id)  # Item ID
-            cand_values.append(hash(item_feats['category']) % 10000)  # Category
-            cand_values.append(hash(item_feats['brand']) % 10000)  # Brand
-            cand_values.append(int(item_feats['price'] * 100))  # Price in cents
+            item_ids.append(cand_id)
+            categories.append(hash(item_feats['category']) % 10000)
+            brands.append(hash(item_feats['brand']) % 10000)
+            prices.append(int(item_feats['price'] * 100))
+
+        # Concatenate all features (grouped by type, not interleaved!)
+        cand_values = brand_counts + item_ids + categories + brands + prices
 
         # All features have num_candidates length
         for _ in range(len(self._candidates_keys)):
@@ -295,8 +299,8 @@ class MTGRBeautyDataset(Dataset):
             List of negative item IDs (as integers)
         """
         # Convert user history to set of integer IDs for fast lookup
-        # Filter out items that don't exist in item2id
-        user_history_ids = {self.item2id[item_id] for item_id in user_history if item_id in self.item2id}
+        # Filter out items that don't have features
+        user_history_ids = {int(item_id) for item_id in user_history if item_id in self.item_features}
 
         negatives = []
         max_attempts = num_samples * 10  # Prevent infinite loop

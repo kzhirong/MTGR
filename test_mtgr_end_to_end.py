@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 from generative_recommenders.dlrm_v3.datasets.beauty_mtgr import MTGRBeautyDataset
 from generative_recommenders.dlrm_v3.datasets.dataset import collate_fn
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig, DlrmHSTU
-from torchrec.modules.embedding_configs import EmbeddingConfig, DataType, PoolingType
+from generative_recommenders.modules.multitask_module import MultitaskTaskType, TaskConfig
+from torchrec.modules.embedding_configs import EmbeddingConfig, DataType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,6 +44,16 @@ def create_mtgr_config(dataset):
         candidates_watchtime_feature_name='',
         candidates_querytime_feature_name='',
     )
+
+    # Add multitask config (required by DlrmHSTU)
+    config.multitask_configs = [
+        TaskConfig(
+            task_name="recommendation",
+            task_weight=1.0,
+            task_type=MultitaskTaskType.BINARY_CLASSIFICATION,
+        )
+    ]
+
     return config
 
 
@@ -51,8 +62,10 @@ def create_embedding_tables(config, dataset):
     tables = {}
 
     # Determine vocabulary sizes from dataset
-    max_user_id = max(dataset.user2id.values())
-    max_item_id = max(dataset.item2id.values())
+    # Get max user ID from actual user data
+    max_user_id = max(int(user['user_id']) for user in dataset.users)
+    # Get max item ID from all items
+    max_item_id = max(dataset.all_item_ids)
 
     logger.info(f"Embedding vocab sizes: user_id={max_user_id + 1}, item_id={max_item_id + 1}")
 
@@ -72,7 +85,6 @@ def create_embedding_tables(config, dataset):
             embedding_dim=config.hstu_embedding_table_dim,
             num_embeddings=num_emb,
             data_type=DataType.FP32,
-            pooling=PoolingType.NONE,
         )
 
     # Sequence features
@@ -91,7 +103,6 @@ def create_embedding_tables(config, dataset):
             embedding_dim=config.hstu_embedding_table_dim,
             num_embeddings=num_emb,
             data_type=DataType.FP32,
-            pooling=PoolingType.NONE,
         )
 
     # Cross features
@@ -106,7 +117,6 @@ def create_embedding_tables(config, dataset):
             embedding_dim=config.hstu_embedding_table_dim,
             num_embeddings=num_emb,
             data_type=DataType.FP32,
-            pooling=PoolingType.NONE,
         )
 
     # Candidate features
@@ -125,7 +135,6 @@ def create_embedding_tables(config, dataset):
             embedding_dim=config.hstu_embedding_table_dim,
             num_embeddings=num_emb,
             data_type=DataType.FP32,
-            pooling=PoolingType.NONE,
         )
 
     return tables
@@ -142,7 +151,6 @@ def test_end_to_end():
     try:
         dataset = MTGRBeautyDataset(
             data_file="data/Beauty_train.pkl",
-            datamaps_file="data/Beauty_datamaps.pkl",
             item_features_file="data/Beauty_item_feature_map.pkl",
             num_negatives=4,
             max_seq_len=100,
@@ -220,6 +228,13 @@ def test_end_to_end():
             is_inference=False,
         )
         logger.info(f"   ✓ Model initialized successfully")
+
+        # Move model to CPU (TorchRec initializes on meta device)
+        device = torch.device("cpu")
+        model = model.to_empty(device=device)
+        # Reset parameters after moving from meta device
+        model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
+        logger.info(f"   ✓ Model materialized on {device}")
 
         # Verify MTGR MLPs exist
         assert hasattr(model, '_mtgr_user_mlp'), "Missing _mtgr_user_mlp"
