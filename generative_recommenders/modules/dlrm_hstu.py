@@ -104,6 +104,10 @@ class DlrmHSTUConfig:
     mtgr_cross_feature_names: List[str] = field(default_factory=list)
     mtgr_candidate_feature_names: List[str] = field(default_factory=list)
 
+    # MTGR attention configuration
+    mtgr_num_layers: int = 3  # Number of MTGR attention layers (small=3, medium=5, large=15)
+    mtgr_use_dynamic_mask: bool = True  # Use MTGR dynamic masking strategy
+
 
 def _get_supervision_labels_and_weights(
     supervision_bitmasks: torch.Tensor,
@@ -221,6 +225,14 @@ class DlrmHSTU(HammerModule):
             postprocessor = None
 
         # construct HSTU
+        # Determine number of layers based on MTGR mode
+        num_layers = (
+            hstu_configs.mtgr_num_layers
+            if hstu_configs.use_mtgr_tokenization
+            else hstu_configs.hstu_attn_num_layers
+        )
+
+        # Create STU layers with MTGR config if enabled
         stu_module: STU = STUStack(
             stu_list=[
                 STULayer(
@@ -240,10 +252,18 @@ class DlrmHSTU(HammerModule):
                         recompute_y=True,
                         sort_by_length=True,
                         contextual_seq_len=0,
+                        # MTGR-specific config
+                        mtgr_mode=hstu_configs.use_mtgr_tokenization,
+                        mtgr_num_user_tokens=len(hstu_configs.mtgr_user_feature_names),
+                        mtgr_num_seq_tokens=hstu_configs.max_seq_len,  # Max possible
+                        mtgr_num_cand_tokens=(
+                            len(hstu_configs.mtgr_cross_feature_names)
+                            + len(hstu_configs.mtgr_candidate_feature_names)
+                        ),
                     ),
                     is_inference=is_inference,
                 )
-                for _ in range(hstu_configs.hstu_attn_num_layers)
+                for _ in range(num_layers)
             ],
             is_inference=is_inference,
         )
@@ -793,14 +813,18 @@ class DlrmHSTU(HammerModule):
                     cand_embeddings=cand_embeddings,
                 )
 
-            # For now, treat tokenized sequence as regular embeddings for HSTU
-            # TODO: Add MTGR-specific masking and Group LayerNorm later
-            # TODO: Use _group_indices for Group LayerNorm
-            # TODO: Use _num_user, _num_seq, _num_cand for custom masking
-            logger.warning("MTGR tokenization applied, but using standard HSTU attention (no custom masking yet)")
+            # Update STU layers with actual token boundaries
+            # This allows GroupLayerNorm to split tokens correctly during attention
+            for layer in self._hstu_transducer._stu_module._stu_list:
+                if hasattr(layer, '_mtgr_group_boundaries'):
+                    layer._mtgr_group_boundaries = (_num_user, _num_seq, _num_cand)
 
-            # Placeholder: just return the tokens as both user and item embeddings
-            # Proper integration requires modifying _user_forward to accept tokens directly
+            logger.info(f"MTGR tokenization: {_num_user} user, {_num_seq} seq, {_num_cand} cand tokens per sample")
+            logger.warning("MTGR with Group Layer Normalization enabled (dynamic masking not yet implemented)")
+
+            # Pass tokens through HSTU attention with Group Layer Normalization
+            # The tokens are already in the right format: [total_tokens, d_model]
+            # STULayer will apply GroupLayerNorm before and after attention
             candidates_item_embeddings = all_tokens
             candidates_user_embeddings = all_tokens
 

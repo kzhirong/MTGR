@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from generative_recommenders.common import fx_unwrap_optional_tensor, HammerModule
+from generative_recommenders.modules.group_layer_norm import GroupLayerNorm
 from generative_recommenders.ops.hstu_attention import delta_hstu_mha
 from generative_recommenders.ops.hstu_compute import (
     hstu_compute_output,
@@ -79,6 +80,12 @@ class STULayerConfig:
     recompute_y: bool = True
     sort_by_length: bool = True
     contextual_seq_len: int = 0
+
+    # MTGR-specific configuration
+    mtgr_mode: bool = False  # Enable MTGR Group Layer Normalization
+    mtgr_num_user_tokens: int = 0  # Number of user tokens per sample
+    mtgr_num_seq_tokens: int = 0   # Max sequence tokens per sample
+    mtgr_num_cand_tokens: int = 0  # Number of candidate tokens per sample
 
 
 @torch.fx.wrap
@@ -245,6 +252,28 @@ class STULayer(STU):
             torch.zeros((output_norm_shape,)),
         )
 
+        # MTGR-specific components
+        self._mtgr_mode: bool = config.mtgr_mode
+        if self._mtgr_mode:
+            # Group Layer Normalization for input (before attention)
+            self._mtgr_input_group_norm = GroupLayerNorm(
+                normalized_shape=self._embedding_dim,
+                eps=1e-6,
+                elementwise_affine=True,
+            )
+            # Group Layer Normalization for output (after attention)
+            self._mtgr_output_group_norm = GroupLayerNorm(
+                normalized_shape=self._embedding_dim,
+                eps=1e-6,
+                elementwise_affine=True,
+            )
+            # Store token boundaries (will be updated during forward pass)
+            self._mtgr_group_boundaries = (
+                config.mtgr_num_user_tokens,
+                config.mtgr_num_seq_tokens,
+                config.mtgr_num_cand_tokens,
+            )
+
     def reset_kv_cache(self) -> None:
         self.k_cache = None
         self.v_cache = None
@@ -299,58 +328,129 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        with record_function("## stu_preprocess_and_attention ##"):
-            u, attn_output, k, v = hstu_preprocess_and_attention(
-                x=x,
-                norm_weight=self._input_norm_weight.to(x.dtype),
-                norm_bias=self._input_norm_bias.to(x.dtype),
-                norm_eps=1e-6,
-                num_heads=self._num_heads,
-                attn_dim=self._attention_dim,
-                hidden_dim=self._hidden_dim,
-                uvqk_weight=self._uvqk_weight.to(x.dtype),
-                uvqk_bias=self._uvqk_beta.to(x.dtype),
+        # MTGR Mode: Apply Group Layer Normalization externally
+        if self._mtgr_mode:
+            # Apply Group LayerNorm before attention
+            x_normed = self._mtgr_input_group_norm(x, self._mtgr_group_boundaries)
+
+            # Call optimized kernel with identity normalization (bypass built-in norm)
+            with record_function("## stu_preprocess_and_attention ##"):
+                u, attn_output, k, v = hstu_preprocess_and_attention(
+                    x=x_normed,
+                    norm_weight=torch.ones_like(self._input_norm_weight).to(x.dtype),  # Identity
+                    norm_bias=torch.zeros_like(self._input_norm_bias).to(x.dtype),     # Identity
+                    norm_eps=1e-6,
+                    num_heads=self._num_heads,
+                    attn_dim=self._attention_dim,
+                    hidden_dim=self._hidden_dim,
+                    uvqk_weight=self._uvqk_weight.to(x.dtype),
+                    uvqk_bias=self._uvqk_beta.to(x.dtype),
+                    max_seq_len=max_seq_len,
+                    seq_offsets=x_offsets,
+                    attn_alpha=self._attn_alpha,
+                    causal=self._causal,
+                    num_targets=num_targets if self._target_aware else None,
+                    max_attn_len=self._max_attn_len,
+                    contextual_seq_len=self._contextual_seq_len,
+                    recompute_uvqk_in_backward=self._recompute_uvqk,
+                    recompute_normed_x_in_backward=self._recompute_normed_x,
+                    sort_by_length=self._sort_by_length,
+                    prefill=kv_caching_lengths is not None,
+                    kernel=self.hammer_kernel(),
+                )
+
+            self.update_kv_cache(
                 max_seq_len=max_seq_len,
                 seq_offsets=x_offsets,
-                attn_alpha=self._attn_alpha,
-                causal=self._causal,
-                num_targets=num_targets if self._target_aware else None,
-                max_attn_len=self._max_attn_len,
-                contextual_seq_len=self._contextual_seq_len,
-                recompute_uvqk_in_backward=self._recompute_uvqk,
-                recompute_normed_x_in_backward=self._recompute_normed_x,
-                sort_by_length=self._sort_by_length,
-                prefill=kv_caching_lengths is not None,
-                kernel=self.hammer_kernel(),
+                k=k,
+                v=v,
+                max_kv_caching_len=max_kv_caching_len,
+                kv_caching_lengths=kv_caching_lengths,
             )
 
-        self.update_kv_cache(
-            max_seq_len=max_seq_len,
-            seq_offsets=x_offsets,
-            k=k,
-            v=v,
-            max_kv_caching_len=max_kv_caching_len,
-            kv_caching_lengths=kv_caching_lengths,
-        )
+            # Compute output with bypassed normalization
+            with record_function("## stu_compute_output ##"):
+                output_unnormed = hstu_compute_output(
+                    attn=attn_output,
+                    u=u,
+                    x=x_normed,
+                    norm_weight=torch.ones_like(self._output_norm_weight).to(x.dtype),  # Identity
+                    norm_bias=torch.zeros_like(self._output_norm_bias).to(x.dtype),     # Identity
+                    norm_eps=1e-6,
+                    dropout_ratio=self._output_dropout_ratio,
+                    output_weight=self._output_weight.to(x.dtype),
+                    group_norm=False,  # We'll apply GroupLayerNorm ourselves
+                    num_heads=self._num_heads,
+                    linear_dim=self._hidden_dim,
+                    concat_ux=True,
+                    training=self.training,
+                    kernel=self.hammer_kernel(),
+                    recompute_y_in_backward=self._recompute_y,
+                )
 
-        with record_function("## stu_compute_output ##"):
-            return hstu_compute_output(
-                attn=attn_output,
-                u=u,
-                x=x,
-                norm_weight=self._output_norm_weight.to(x.dtype),
-                norm_bias=self._output_norm_bias.to(x.dtype),
-                norm_eps=1e-6,
-                dropout_ratio=self._output_dropout_ratio,
-                output_weight=self._output_weight.to(x.dtype),
-                group_norm=self._use_group_norm,
-                num_heads=self._num_heads,
-                linear_dim=self._hidden_dim,
-                concat_ux=True,
-                training=self.training,
-                kernel=self.hammer_kernel(),
-                recompute_y_in_backward=self._recompute_y,
+                # Apply Group LayerNorm after attention
+                output_normed = self._mtgr_output_group_norm(
+                    output_unnormed,
+                    self._mtgr_group_boundaries
+                )
+
+                # Residual connection
+                return output_normed + x
+
+        # Standard HSTU Mode (unchanged)
+        else:
+            with record_function("## stu_preprocess_and_attention ##"):
+                u, attn_output, k, v = hstu_preprocess_and_attention(
+                    x=x,
+                    norm_weight=self._input_norm_weight.to(x.dtype),
+                    norm_bias=self._input_norm_bias.to(x.dtype),
+                    norm_eps=1e-6,
+                    num_heads=self._num_heads,
+                    attn_dim=self._attention_dim,
+                    hidden_dim=self._hidden_dim,
+                    uvqk_weight=self._uvqk_weight.to(x.dtype),
+                    uvqk_bias=self._uvqk_beta.to(x.dtype),
+                    max_seq_len=max_seq_len,
+                    seq_offsets=x_offsets,
+                    attn_alpha=self._attn_alpha,
+                    causal=self._causal,
+                    num_targets=num_targets if self._target_aware else None,
+                    max_attn_len=self._max_attn_len,
+                    contextual_seq_len=self._contextual_seq_len,
+                    recompute_uvqk_in_backward=self._recompute_uvqk,
+                    recompute_normed_x_in_backward=self._recompute_normed_x,
+                    sort_by_length=self._sort_by_length,
+                    prefill=kv_caching_lengths is not None,
+                    kernel=self.hammer_kernel(),
+                )
+
+            self.update_kv_cache(
+                max_seq_len=max_seq_len,
+                seq_offsets=x_offsets,
+                k=k,
+                v=v,
+                max_kv_caching_len=max_kv_caching_len,
+                kv_caching_lengths=kv_caching_lengths,
             )
+
+            with record_function("## stu_compute_output ##"):
+                return hstu_compute_output(
+                    attn=attn_output,
+                    u=u,
+                    x=x,
+                    norm_weight=self._output_norm_weight.to(x.dtype),
+                    norm_bias=self._output_norm_bias.to(x.dtype),
+                    norm_eps=1e-6,
+                    dropout_ratio=self._output_dropout_ratio,
+                    output_weight=self._output_weight.to(x.dtype),
+                    group_norm=self._use_group_norm,
+                    num_heads=self._num_heads,
+                    linear_dim=self._hidden_dim,
+                    concat_ux=True,
+                    training=self.training,
+                    kernel=self.hammer_kernel(),
+                    recompute_y_in_backward=self._recompute_y,
+                )
 
     def cached_forward(
         self,

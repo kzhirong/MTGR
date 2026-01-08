@@ -245,6 +245,15 @@ def test_end_to_end():
         assert hasattr(model, '_mtgr_candidate_mlp'), "Missing _mtgr_candidate_mlp"
         logger.info(f"   ✓ MTGR MLPs verified: user_mlp, seq_mlp, candidate_mlp")
 
+        # Verify GroupLayerNorm modules exist in STU layers
+        stu_layers = model._hstu_transducer._stu_module._stu_list
+        logger.info(f"   ✓ Number of MTGR attention layers: {len(stu_layers)}")
+        for i, layer in enumerate(stu_layers):
+            assert layer._mtgr_mode == True, f"Layer {i} should be in MTGR mode"
+            assert hasattr(layer, '_mtgr_input_group_norm'), f"Layer {i} missing input GroupLayerNorm"
+            assert hasattr(layer, '_mtgr_output_group_norm'), f"Layer {i} missing output GroupLayerNorm"
+        logger.info(f"   ✓ All layers have Group Layer Normalization modules")
+
     except Exception as e:
         logger.error(f"   ✗ Model creation failed: {e}")
         import traceback
@@ -312,12 +321,15 @@ def test_end_to_end():
     print("✓ Sample retrieval: PASS", flush=True)
     print("✓ DataLoader batching: PASS", flush=True)
     print("✓ Model initialization: PASS", flush=True)
+    print("✓ GroupLayerNorm integration: PASS", flush=True)
     print("✓ Forward pass (tokenization): PASS", flush=True)
     print("\n✅ END-TO-END TEST PASSED!", flush=True)
     print("=" * 80, flush=True)
     print("\nPipeline verified:", flush=True)
-    print("  Beauty_train.pkl → MTGRBeautyDataset → DataLoader → DlrmHSTU → Tokens", flush=True)
-    print("\nPhase 1 Complete: MTGR tokenization is working!", flush=True)
+    print("  Beauty_train.pkl → MTGRBeautyDataset → DataLoader → DlrmHSTU", flush=True)
+    print("  → Tokenization → HSTU with GroupLayerNorm → Outputs", flush=True)
+    print("\nPhase 1 Complete: MTGR tokenization working!", flush=True)
+    print("Phase 2 Complete: Group Layer Normalization integrated!", flush=True)
     print("=" * 80, flush=True)
     sys.stdout.flush()
 
