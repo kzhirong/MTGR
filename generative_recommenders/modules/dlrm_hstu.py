@@ -815,7 +815,7 @@ class DlrmHSTU(HammerModule):
 
             # Update STU layers with actual token boundaries
             # This allows GroupLayerNorm to split tokens correctly during attention
-            for layer in self._hstu_transducer._stu_module._stu_list:
+            for layer in self._hstu_transducer._stu_module._stu_layers:
                 if hasattr(layer, '_mtgr_group_boundaries'):
                     layer._mtgr_group_boundaries = (_num_user, _num_seq, _num_cand)
 

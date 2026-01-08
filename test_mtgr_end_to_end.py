@@ -246,7 +246,7 @@ def test_end_to_end():
         logger.info(f"   ✓ MTGR MLPs verified: user_mlp, seq_mlp, candidate_mlp")
 
         # Verify GroupLayerNorm modules exist in STU layers
-        stu_layers = model._hstu_transducer._stu_module._stu_list
+        stu_layers = model._hstu_transducer._stu_module._stu_layers
         logger.info(f"   ✓ Number of MTGR attention layers: {len(stu_layers)}")
         for i, layer in enumerate(stu_layers):
             assert layer._mtgr_mode == True, f"Layer {i} should be in MTGR mode"

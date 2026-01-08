@@ -328,74 +328,103 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # MTGR Mode: Apply Group Layer Normalization externally
+        # MTGR Mode: Decomposed operations with Group Layer Normalization
         if self._mtgr_mode:
-            # Apply Group LayerNorm before attention
-            x_normed = self._mtgr_input_group_norm(x, self._mtgr_group_boundaries)
+            # Step 1: Apply Group LayerNorm to input (normalizes by domain)
+            with record_function("## mtgr_input_group_norm ##"):
+                x_normed = self._mtgr_input_group_norm(x, self._mtgr_group_boundaries)
 
-            # Call optimized kernel with identity normalization (bypass built-in norm)
-            with record_function("## stu_preprocess_and_attention ##"):
-                u, attn_output, k, v = hstu_preprocess_and_attention(
-                    x=x_normed,
-                    norm_weight=torch.ones_like(self._input_norm_weight).to(x.dtype),  # Identity
-                    norm_bias=torch.zeros_like(self._input_norm_bias).to(x.dtype),     # Identity
-                    norm_eps=1e-6,
-                    num_heads=self._num_heads,
-                    attn_dim=self._attention_dim,
-                    hidden_dim=self._hidden_dim,
-                    uvqk_weight=self._uvqk_weight.to(x.dtype),
-                    uvqk_bias=self._uvqk_beta.to(x.dtype),
+            # Step 2: Manual UVQK projection (without normalization)
+            # This replicates hstu_compute_uqvk but skips the built-in LayerNorm
+            with record_function("## mtgr_uvqk_projection ##"):
+                # Linear projection: uvqk = x_normed @ W + b
+                uvqk = torch.addmm(
+                    self._uvqk_beta.to(x.dtype),
+                    x_normed,
+                    self._uvqk_weight.to(x.dtype)
+                )
+
+                # Split into U, V, Q, K
+                u, v, q, k = torch.split(
+                    uvqk,
+                    [
+                        self._hidden_dim * self._num_heads,
+                        self._hidden_dim * self._num_heads,
+                        self._attention_dim * self._num_heads,
+                        self._attention_dim * self._num_heads,
+                    ],
+                    dim=1,
+                )
+
+                # Apply SiLU activation to U
+                u = torch.nn.functional.silu(u)
+
+                # Reshape Q, K, V for multi-head attention
+                q = q.view(-1, self._num_heads, self._attention_dim)
+                k = k.view(-1, self._num_heads, self._attention_dim)
+                v = v.view(-1, self._num_heads, self._hidden_dim)
+
+            # Step 3: Call attention-only kernel (no normalization inside)
+            with record_function("## mtgr_attention ##"):
+                from generative_recommenders.ops.hstu_attention import hstu_mha
+                attn_output = hstu_mha(
                     max_seq_len=max_seq_len,
+                    alpha=self._attn_alpha,
+                    q=q,
+                    k=k,
+                    v=v,
                     seq_offsets=x_offsets,
-                    attn_alpha=self._attn_alpha,
                     causal=self._causal,
+                    dropout_pr=0.0,
+                    training=self.training,
                     num_targets=num_targets if self._target_aware else None,
                     max_attn_len=self._max_attn_len,
                     contextual_seq_len=self._contextual_seq_len,
-                    recompute_uvqk_in_backward=self._recompute_uvqk,
-                    recompute_normed_x_in_backward=self._recompute_normed_x,
                     sort_by_length=self._sort_by_length,
-                    prefill=kv_caching_lengths is not None,
                     kernel=self.hammer_kernel(),
                 )
 
+            # Update KV cache if needed
             self.update_kv_cache(
                 max_seq_len=max_seq_len,
                 seq_offsets=x_offsets,
-                k=k,
-                v=v,
+                k=k.flatten(1, 2),
+                v=v.flatten(1, 2),
                 max_kv_caching_len=max_kv_caching_len,
                 kv_caching_lengths=kv_caching_lengths,
             )
 
-            # Compute output with bypassed normalization
-            with record_function("## stu_compute_output ##"):
-                output_unnormed = hstu_compute_output(
-                    attn=attn_output,
-                    u=u,
-                    x=x_normed,
-                    norm_weight=torch.ones_like(self._output_norm_weight).to(x.dtype),  # Identity
-                    norm_bias=torch.zeros_like(self._output_norm_bias).to(x.dtype),     # Identity
-                    norm_eps=1e-6,
-                    dropout_ratio=self._output_dropout_ratio,
-                    output_weight=self._output_weight.to(x.dtype),
-                    group_norm=False,  # We'll apply GroupLayerNorm ourselves
-                    num_heads=self._num_heads,
-                    linear_dim=self._hidden_dim,
-                    concat_ux=True,
-                    training=self.training,
-                    kernel=self.hammer_kernel(),
-                    recompute_y_in_backward=self._recompute_y,
-                )
+            # Step 4: Manual output processing (without normalization)
+            with record_function("## mtgr_output_processing ##"):
+                # attn_output is [B, H, D] from hstu_mha, reshape to [B, H*D]
+                attn_flat = attn_output.view(-1, self._num_heads * self._hidden_dim)
 
-                # Apply Group LayerNorm after attention
+                # Element-wise multiply: y = attn ⊙ u
+                y = attn_flat * u
+
+                # Concatenate [y, u, x_normed] as per HSTU architecture
+                concat = torch.cat([y, u, x_normed], dim=1)
+
+                # Apply dropout if training
+                if self.training and self._output_dropout_ratio > 0:
+                    concat = torch.nn.functional.dropout(
+                        concat,
+                        p=self._output_dropout_ratio,
+                        training=True
+                    )
+
+                # Final linear projection: output = concat @ W
+                output_unnormed = torch.matmul(concat, self._output_weight.to(x.dtype))
+
+            # Step 5: Apply Group LayerNorm to output
+            with record_function("## mtgr_output_group_norm ##"):
                 output_normed = self._mtgr_output_group_norm(
                     output_unnormed,
                     self._mtgr_group_boundaries
                 )
 
-                # Residual connection
-                return output_normed + x
+            # Step 6: Residual connection
+            return output_normed + x
 
         # Standard HSTU Mode (unchanged)
         else:
