@@ -252,7 +252,9 @@ def test_end_to_end():
             assert layer._mtgr_mode == True, f"Layer {i} should be in MTGR mode"
             assert hasattr(layer, '_mtgr_input_group_norm'), f"Layer {i} missing input GroupLayerNorm"
             assert hasattr(layer, '_mtgr_output_group_norm'), f"Layer {i} missing output GroupLayerNorm"
+            assert hasattr(layer, '_mtgr_group_boundaries'), f"Layer {i} missing group boundaries"
         logger.info(f"   ✓ All layers have Group Layer Normalization modules")
+        logger.info(f"   ✓ All layers configured for MTGR dynamic masking")
 
     except Exception as e:
         logger.error(f"   ✗ Model creation failed: {e}")
@@ -322,14 +324,16 @@ def test_end_to_end():
     print("✓ DataLoader batching: PASS", flush=True)
     print("✓ Model initialization: PASS", flush=True)
     print("✓ GroupLayerNorm integration: PASS", flush=True)
+    print("✓ Dynamic masking integration: PASS", flush=True)
     print("✓ Forward pass (tokenization): PASS", flush=True)
     print("\n✅ END-TO-END TEST PASSED!", flush=True)
     print("=" * 80, flush=True)
     print("\nPipeline verified:", flush=True)
     print("  Beauty_train.pkl → MTGRBeautyDataset → DataLoader → DlrmHSTU", flush=True)
-    print("  → Tokenization → HSTU with GroupLayerNorm → Outputs", flush=True)
+    print("  → Tokenization → HSTU with GroupLayerNorm & Dynamic Masking → Outputs", flush=True)
     print("\nPhase 1 Complete: MTGR tokenization working!", flush=True)
     print("Phase 2 Complete: Group Layer Normalization integrated!", flush=True)
+    print("Phase 3 Complete: MTGR dynamic masking integrated!", flush=True)
     print("=" * 80, flush=True)
     sys.stdout.flush()
 

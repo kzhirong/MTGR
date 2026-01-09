@@ -364,25 +364,60 @@ class STULayer(STU):
                 k = k.view(-1, self._num_heads, self._attention_dim)
                 v = v.view(-1, self._num_heads, self._hidden_dim)
 
-            # Step 3: Call attention-only kernel (no normalization inside)
+            # Step 3: MTGR Attention with Dynamic Masking
             with record_function("## mtgr_attention ##"):
-                from generative_recommenders.ops.hstu_attention import hstu_mha
-                attn_output = hstu_mha(
-                    max_seq_len=max_seq_len,
-                    alpha=self._attn_alpha,
-                    q=q,
-                    k=k,
-                    v=v,
-                    seq_offsets=x_offsets,
-                    causal=self._causal,
-                    dropout_pr=0.0,
-                    training=self.training,
-                    num_targets=num_targets if self._target_aware else None,
-                    max_attn_len=self._max_attn_len,
-                    contextual_seq_len=self._contextual_seq_len,
-                    sort_by_length=self._sort_by_length,
-                    kernel=self.hammer_kernel(),
+                # Calculate batch size and tokens per sample
+                total_per_sample = sum(self._mtgr_group_boundaries)
+                total_tokens = q.shape[0]
+                batch_size = total_tokens // total_per_sample
+
+                # Create MTGR mask (diagonal masking for candidates)
+                from generative_recommenders.modules.mtgr_mask import create_mtgr_mask
+
+                mask_2d = create_mtgr_mask(
+                    num_user=self._mtgr_group_boundaries[0],
+                    num_seq=self._mtgr_group_boundaries[1],
+                    num_cand=self._mtgr_group_boundaries[2],
+                    batch_size=batch_size,
+                    device=q.device,
+                )  # Shape: [total_tokens, total_tokens]
+
+                # Reshape mask for multi-head attention
+                # [total_tokens, total_tokens] → [batch, num_heads, seq_len, seq_len]
+                mask_per_sample = mask_2d.view(
+                    batch_size,
+                    total_per_sample,
+                    total_per_sample
                 )
+                # Expand for multiple heads (broadcast over head dimension)
+                mask_4d = mask_per_sample.unsqueeze(1)  # [batch, 1, seq_len, seq_len]
+
+                # Reshape Q, K, V for PyTorch attention
+                # From: [total_tokens, num_heads, dim]
+                # To:   [batch, num_heads, seq_len, dim]
+                q_4d = q.view(batch_size, total_per_sample, self._num_heads, self._attention_dim)
+                q_4d = q_4d.transpose(1, 2)  # [batch, num_heads, seq_len, dim]
+
+                k_4d = k.view(batch_size, total_per_sample, self._num_heads, self._attention_dim)
+                k_4d = k_4d.transpose(1, 2)
+
+                v_4d = v.view(batch_size, total_per_sample, self._num_heads, self._hidden_dim)
+                v_4d = v_4d.transpose(1, 2)
+
+                # Apply PyTorch native attention with MTGR mask
+                attn_output_4d = torch.nn.functional.scaled_dot_product_attention(
+                    query=q_4d,
+                    key=k_4d,
+                    value=v_4d,
+                    attn_mask=mask_4d,
+                    dropout_p=0.0,
+                    scale=self._attn_alpha,
+                )  # Shape: [batch, num_heads, seq_len, hidden_dim]
+
+                # Reshape back to match expected output format
+                # [batch, num_heads, seq_len, hidden_dim] → [total_tokens, num_heads, hidden_dim]
+                attn_output = attn_output_4d.transpose(1, 2).contiguous()
+                attn_output = attn_output.view(total_tokens, self._num_heads, self._hidden_dim)
 
             # Update KV cache if needed
             self.update_kv_cache(

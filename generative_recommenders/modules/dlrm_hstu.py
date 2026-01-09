@@ -820,7 +820,7 @@ class DlrmHSTU(HammerModule):
                     layer._mtgr_group_boundaries = (_num_user, _num_seq, _num_cand)
 
             logger.info(f"MTGR tokenization: {_num_user} user, {_num_seq} seq, {_num_cand} cand tokens per sample")
-            logger.warning("MTGR with Group Layer Normalization enabled (dynamic masking not yet implemented)")
+            logger.info("MTGR with Group Layer Normalization and Dynamic Masking enabled")
 
             # Pass tokens through HSTU attention with Group Layer Normalization
             # The tokens are already in the right format: [total_tokens, d_model]
